@@ -3,6 +3,7 @@ from flask_socketio import SocketIO, emit
 import base64, time, threading, cv2, os
 from ultralytics import YOLO
 import datetime
+from flask import request, jsonify
 
 import eventlet
 eventlet.monkey_patch()
@@ -10,14 +11,19 @@ eventlet.monkey_patch()
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+UPLOAD_FOLDER = "uploaded_videos"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 CAMERA_ID = 0
 processing = False
-model = YOLO("model/test_3.pt")
+model = YOLO("model/best.pt")
 stop_signal = False
 video_processing = False
 video_paused = False
 video_thread = None
 video_frames_buffer = []
+last_video_path = None  # <-- thêm global để lưu video trước đó
+
 
 def color_box(class_name):
     colors = {
@@ -100,6 +106,8 @@ def process_stream():
             cv2.rectangle(frame, (x1, y1 - text_height - 10), (x1 + text_width + 4, y1), color, -1)
             cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
+        frame = cv2.resize(frame, (854, 450))
+
         _, buffer = cv2.imencode('.jpg', frame)
         encoded_img = base64.b64encode(buffer).decode('utf-8')
 
@@ -109,7 +117,7 @@ def process_stream():
             "avg_inference_time": inference_time,
         })
 
-        socketio.sleep(0.2)
+        socketio.sleep(0.4)
 
     cap.release()
     processing = False
@@ -117,13 +125,27 @@ def process_stream():
 
     socketio.emit("clear_frame_realtime")
 
-@socketio.on("video_path")
-def handle_video_path(data):
-    global video_processing, video_paused, video_thread
+@app.route("/upload_video", methods=["POST"])
+def upload_video():
+    if 'video' not in request.files:
+        return jsonify({"success": False, "error": "No video file provided"}), 400
 
-    path = data.get("path")
-    print("[INFO] Video path received:", path)
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "Empty filename"}), 400
 
+    save_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(save_path)
+
+    print(f"[UPLOAD] Video saved to: {save_path}")
+
+    # Gọi trực tiếp
+    threading.Thread(target=process_video, args=(save_path,)).start()
+
+    return jsonify({"success": True, "path": save_path})
+
+def process_video(path):
+    global video_processing, video_paused, video_frames_buffer
     if not os.path.exists(path) or not os.path.isfile(path):
         print("[ERROR] Invalid file path")
         return
@@ -132,13 +154,10 @@ def handle_video_path(data):
     if not cap.isOpened():
         print("[ERROR] Cannot open video")
         return
-    
-    if video_processing:
-        print("[WARN] Video is already processing")
-        return
-    
+
     video_processing = True
     video_paused = False
+    video_frames_buffer.clear()
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"[INFO] Total frames: {total_frames}")
@@ -175,13 +194,12 @@ def handle_video_path(data):
             x1, y1, x2, y2 = map(int, det["box"])
             color = color_box(det["class"])
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
             label = f'{det["class"]} {det["confidence"]}%'
-
-            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(frame, (x1, y1 - text_height - 10), (x1 + text_width + 4, y1), color, -1)
             cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
+        frame = cv2.resize(frame, (854, 450))
         video_frames_buffer.append(frame.copy())
 
         _, buffer = cv2.imencode('.jpg', frame)
@@ -194,14 +212,11 @@ def handle_video_path(data):
         })
 
         print(f"[INFO] Processed frame {current_frame + 1}/{total_frames}")
-
         socketio.sleep(0.2)
 
     cap.release()
     video_processing = False
     socketio.emit("video_done")
-
-    # cv2.destroyAllWindows()
     print("[✅] Video detection complete and sent to client.")
 
 @socketio.on("render_video")
